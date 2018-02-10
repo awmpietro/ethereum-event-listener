@@ -23,10 +23,11 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
-
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
 )
 
 // Config has the configuration data needed provided by toml file
@@ -36,6 +37,9 @@ type Config struct {
 	PrivateKey      string
 	AbiPath         string
 	EventName       string
+	BlockNumber     *big.Int
+	DbName          string
+	DbCollection    string
 }
 
 // Provider has the variables needed to communicate with the Ethereum RPC
@@ -47,8 +51,20 @@ type Provider struct {
 	auth            *bind.TransactOpts
 }
 
+// ContractEvent maps from the events data in a struct
+type ContractEvent struct {
+	Name  string
+	Count *big.Int
+}
+
+// EventCounter maps the Mongo collection used to keep track of the events
+type EventCounter struct {
+	Counter int
+}
+
 // conf holds the filled Config struct
 var conf *Config
+var session *mgo.Session
 
 // setUp is responsible for initializing the needed vars
 func (p *Provider) setUp() {
@@ -71,6 +87,82 @@ func (p *Provider) setUp() {
 	p.auth = bind.NewKeyedTransactor(p.privateKey)
 }
 
+// checkEventLog check if all events emitted are in track in Mongo. If no, do a routine to update and
+// forward non tracked events
+func checkEventLog(logs []types.Log) {
+	c := session.DB(conf.DbCollection).C(conf.DbName) //Db=eventsCounter, Collection/Table=counter
+	var eventCounter EventCounter
+	err := c.Find(bson.M{}).One(&eventCounter)
+	if err != nil {
+		log.Fatal("MongoDB Find: ", err)
+	}
+	if eventCounter.Counter != len(logs) {
+		// Events are desynchronized, do something
+		left := len(logs) - eventCounter.Counter
+		for i := (len(logs) - left); i < len(logs); i++ {
+			forwardEvents(logs[i])
+		}
+		updateCounter(len(logs))
+	}
+	return
+}
+
+// updateCounter updates the events counter in Mongo
+func updateCounter(current int) {
+	c := session.DB(conf.DbCollection).C(conf.DbName)
+	var eventCounter EventCounter
+	eventCounter.Counter = current
+	err := c.Update(bson.M{}, &eventCounter)
+	if err != nil {
+		fmt.Println("Can't update MongoDB")
+		return
+	}
+}
+
+//incrementCounter increments the events counter in Mongo
+func incrementCounter() {
+	c := session.DB(conf.DbCollection).C(conf.DbName)
+	var eventCounter EventCounter
+	err := c.Find(bson.M{}).One(&eventCounter)
+	if err != nil {
+		log.Fatal(err)
+	}
+	eventCounter.Counter++
+	updateCounter(eventCounter.Counter)
+}
+
+// forwaredEvents will forward the emitted events as they arrive
+func forwardEvents(log types.Log) {
+	fmt.Println("Mais um")
+	//contractAbi := getContractAbi()
+	/*
+		Forward events somewhere
+		Example of what to do with the event log data
+		contractEvent := ContractEvent{}
+		err = contractAbi.Unpack(&contractEvent, conf.EventName, log.Data)
+		if err != nil {
+			fmt.Println("Failed to unpack:", err)
+		}
+		fmt.Println("Contract Address:", log.Address.Hex())
+		fmt.Println("Name:", contractEvent.Name)
+		fmt.Println("Counter:", contractEvent.Count)
+	*/
+}
+
+//getContractAbi returs the contract ABI
+func getContractAbi() abi.ABI {
+	abiPath, _ := filepath.Abs(conf.AbiPath)
+	file, err := ioutil.ReadFile(abiPath)
+	if err != nil {
+		fmt.Println("Failed to read file:", err)
+	}
+	contractAbi, err := abi.JSON(strings.NewReader(string(file)))
+	if err != nil {
+		fmt.Println("Invalid abi:", err)
+	}
+	return contractAbi
+}
+
 // main function of the program
 func main() {
 	if _, err := toml.DecodeFile("./config.toml", &conf); err != nil {
@@ -82,50 +174,48 @@ func main() {
 	// p.auth.Nonce = big.NewInt(nonce)
 
 	// Contract Method which triggers an Event for testing
-	tx, err := provider.contractClient.Greet(provider.auth, "Hi Gopher! Event was triggered")
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Printf("Transaction TX: 0x%x\n", tx.Hash())
+	/*
+		tx, err := provider.contractClient.Greet(provider.auth, "Hi Gopher! Event was triggered")
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("Transaction TX: 0x%x\n", tx.Hash())
+	*/
 
 	// Listening to an event
 	query := ethereum.FilterQuery{
 		Addresses: []common.Address{provider.contractAddress},
+		FromBlock: conf.BlockNumber,
 	}
-	var eventCh = make(chan types.Log)
 	ctx := context.Background()
+
+	var eventCh = make(chan types.Log)
+
 	sub, err := provider.client.SubscribeFilterLogs(ctx, query, eventCh)
 	if err != nil {
 		log.Println("Subscribe Failed: ", err)
 		return
 	}
-	abiPath, _ := filepath.Abs(conf.AbiPath)
-	file, err := ioutil.ReadFile(abiPath)
+	// Check events logs
+	logs, err := provider.client.FilterLogs(ctx, query)
 	if err != nil {
-		fmt.Println("Failed to read file:", err)
+		fmt.Println("Filter Logs: ", err)
 	}
-	contractAbi, err := abi.JSON(strings.NewReader(string(file)))
+	session, err = mgo.Dial("localhost")
 	if err != nil {
-		fmt.Println("Invalid abi:", err)
+		fmt.Println("Failed to start Mongo session:", err)
 	}
+	checkEventLog(logs)
+	session.Close()
+
 	// The program keeps in a loop listening to the event which is stored in eventCh channel
 	for {
 		select {
 		case err := <-sub.Err():
 			log.Fatal(err) // Error
 		case log := <-eventCh:
-			var contractEvent struct {
-				Name  string
-				Count *big.Int
-			}
-			err = contractAbi.Unpack(&contractEvent, conf.EventName, log.Data)
-			if err != nil {
-				fmt.Println("Failed to unpack:", err)
-			}
-			// Example of what to do with the event log data
-			fmt.Println("Contract Address:", log.Address.Hex())
-			fmt.Println("Name:", contractEvent.Name)
-			fmt.Println("Counter:", contractEvent.Count)
+			incrementCounter()
+			forwardEvents(log)
 		}
 	}
 }
