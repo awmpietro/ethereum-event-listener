@@ -1,5 +1,0 @@
-ProviderURL         = "wss://rinkeby.infura.io/_ws"
-ContractAddress     = "YOUR_CONTRACT_ADDRESS"
-PrivateKey          = "YOUR_ACCOUNT_PRIVATE_KEY"
-AbiPath             = "./contracts/MyContract.abi"
-EventName           = "_MyEvent"
